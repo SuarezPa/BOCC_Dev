@@ -1,0 +1,111 @@
+#!/usr/bin/env groovy
+
+/* Only keep the 10 most recent builds. */
+def projectProperties = [
+    buildDiscarder(logRotator(numToKeepStr: '10')),
+]
+
+if (!env.CHANGE_ID) {
+    if (env.GIT_BRANCH != 'master') {
+        projectProperties.add(pipelineTriggers([pollSCM('H/2 * * * *')]))
+        projectProperties.add(disableConcurrentBuilds())
+    }
+}
+properties(projectProperties)
+
+
+
+pipeline {
+    agent {
+	    label 'jenkins-slave-azcli'
+	}
+    tools {
+        nodejs "NodeJs14"
+    }
+    options {
+		timeout(time: 15, unit: 'MINUTES')
+	}
+
+    stages{
+
+        stage('Build') {
+            steps {
+                script {
+                     methodOrchestrator('build')
+                }
+            }
+       }
+
+        stage('SonarQube Analysis') {
+            steps {
+                script {
+                    methodOrchestrator('sonarScanner')
+                }
+            }
+        }
+
+        stage('Deploy functions') {
+            steps{
+                script {
+                    methodOrchestrator('deploy')
+                }
+            }
+        }
+            
+    }// end stages
+}// end pipeline
+
+
+//==============================================================================================
+
+def methodOrchestrator(String operation){
+    try {
+        if(operation.equals("build")){
+            build()
+        }else if(operation.equals("sonarScanner")){
+            sonarScanner()
+        }else if(operation.equals("deploy")){
+            deploy()
+        }
+    }catch(Exception e){
+        println e
+	throw e
+    }
+}
+
+
+def build (){
+    sh 'npm install'
+    sh 'npm run build'
+    sh 'zip -r deploy.zip ./* -x config\\*'
+}
+
+def sonarScanner() {
+    dir("${env.WORKSPACE}"){
+        def scannerHome = tool 'sonarqubescanner';
+        withSonarQubeEnv("${env.SONAR_SERVER}") {
+            sh "${scannerHome}/bin/sonar-scanner -Dsonar.exclusions=config/** -Dsonar.projectKey=${SONAR_PROJECT_KEY} -Dsonar.sources=."
+        }
+        def qg = waitForQualityGate()
+        if (qg.status != 'OK') {
+            error "Pipeline aborted due to quality gate failure: ${qg.status}"
+        }
+    }
+}
+
+def deploy() {
+    withCredentials([azureServicePrincipal(
+                        credentialsId: CREDENTIAL_SERVICE_PRINCIPAL,
+                        subscriptionIdVariable: 'AZURE_SUBSCRIPTION_ID',
+                        clientIdVariable: 'AZURE_CLIENT_ID',
+                        clientSecretVariable: 'AZURE_CLIENT_SECRET',
+                        tenantIdVariable: 'AZURE_TENANT_ID')]) {
+        // some block
+        sh '''
+            az login --service-principal -u $AZURE_CLIENT_ID -p $AZURE_CLIENT_SECRET -t $AZURE_TENANT_ID
+            az account set -s $DEPLOY_AZURE_SUBSCRIPTION_ID
+        '''
+        sh 'az functionapp deployment source config-zip  -g $RESOURCE_GROUP -n $FUNC_NAME --src deploy.zip'
+        sh 'az logout'
+    }
+}
